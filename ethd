@@ -50,10 +50,12 @@ determine_docker() {
 }
 
 determine_compose() {
-# This is mainly for Debian and docker-ce, where docker-compose does not exist
-  if ! type -P docker-compose >/dev/null 2>&1; then
+# Check for Compose V2 (docker compose) vs Compose V1 (docker-compose)
+  if docker compose version >/dev/null 2>&1; then
     __compose_exe="docker compose"
+    __old_compose=0
   else
+    __old_compose=1
     __compose_version=$($__maybe_sudo docker-compose --version | sed -n -E -e "s/.*version [v]?([0-9.-]*).*/\1/ip")
     __compose_version_major=$(echo "$__compose_version" | cut -f1 -d.)
     __compose_version_minor=$(echo "$__compose_version" | cut -f2 -d.)
@@ -160,7 +162,7 @@ install() {
     esac
     if [[ "$__distro" = "ubuntu" ]]; then
         __major_version=$(lsb_release -r | cut -d: -f2 | sed s/'^\t'// | cut -d. -f1)
-        if [ "${__major_version}" -lt 18 ]; then
+        if [ "${__major_version}" -lt 20 ]; then
             echo "This script cannot install docker on Ubuntu ${__major_version}. Consider upgrading to 22.04 or 20.04"
             exit 0
         fi
@@ -189,6 +191,11 @@ install() {
         if [ -z "$(command -v docker)" ]; then
             ${__auto_sudo} apt-get update
             ${__auto_sudo} apt-get -y install ca-certificates curl gnupg lsb-release whiptail bc chrony
+            __major_version=$(lsb_release -r | cut -f2)
+            if [ "${__major_version}" -lt 10 ]; then
+                echo "This script cannot install docker on Debian ${__major_version}. Consider upgrading to 11 or 12."
+                exit 0
+            fi
             ${__auto_sudo} mkdir -p /etc/apt/keyrings
             ${__auto_sudo} curl -fsSL https://download.docker.com/linux/debian/gpg | ${__auto_sudo} gpg --dearmor -o /etc/apt/keyrings/docker.gpg
             ${__auto_sudo} echo \
@@ -238,46 +245,35 @@ install() {
     return 0
 }
 
-check_for_apparmor() {
-# This function could be removed once https://github.com/moby/moby/issues/44970 is resolved
-    # Only relevant to ubuntu or debian
-    if [[ ! "$__distro" = "ubuntu" ]] && [[ ! "$__distro" =~ "debian" ]]; then
-        return 0
-    fi
-    # Docker-CE 23.0.x has an issue where containers will fail if apparmor
-    # is not installed. Remedy.
-    if [ "$(dpkg-query -W -f='${Status}' apparmor 2>/dev/null | grep -c "ok installed")" = "0" ]; then
-        echo "apparmor is required for docker-ce 23.0.x to function"
-        echo
-        while true; do
-            read -rp "Do you consent to installation of apparmor? (yes/no) " yn
-            case $yn in
-                [Nn]* ) echo "No changes made"; return 0;;
-                * ) break;;
-            esac
-        done
-        ${__auto_sudo} apt-get update
-        ${__auto_sudo} apt-get -y install apparmor
-    fi
-    return 0
-}
-
 # Warn user if space is low, so they can prune
 check_disk_space() {
-    __docker_dir=$(docker system info --format '{{.DockerRootDir}}')
-    __free_space=$(df -P ${__docker_dir} | awk '/[0-9]%/{print $(NF-2)}')
+    __docker_dir=$(dodocker system info --format '{{.DockerRootDir}}')
+    __free_space=$(df -P "${__docker_dir}" | awk '/[0-9]%/{print $(NF-2)}')
+
+    re='^[0-9]+$'
+    if ! [[ "${__free_space}" =~ $re ]] ; then
+        echo "Unable to determine free disk space. This is likely a bug."
+        echo "df reports $(df -P "${__docker_dir}") and __free_space is ${__free_space}"
+        return
+    fi
 
     var="COMPOSE_FILE"
     value=$(sed -n -e "s/^${var}=\(.*\)/\1/p" ".env" || true)
+    var="AUTOPRUNE_NM"
+    auto_prune=$(sed -n -e "s/^${var}=\(.*\)/\1/p" ".env" || true)
 
+# Literal match intended
+# shellcheck disable=SC2076
     if [[ "${value}" =~ "nethermind.yml" ]] && [[ "${__free_space}" -lt 314572800 ]]; then
         echo ""
         echo "You are running Nethermind and have less than 300 GiB of free disk space."
-        echo "If Avail reads 250 GiB or more, prune with ./ethd prune-nethermind:"
+        if [ "${auto_prune}" = true ]; then
+          echo "It should currently be auto-pruning, check logs. Free space:"
+        else
+          echo "If the below reads above 250 GiB free, prune it with \"./ethd prune-nethermind\""
+        fi
         echo ""
         df -h "${__docker_dir}"
-        echo ""
-        echo "If it's less than 250 GiB, you may need to resync Nethermind from scratch."
         echo ""
     elif [[ "${value}" =~ "geth.yml" ]] && [[ "${__free_space}" -lt 104857600 ]]; then
         echo ""
@@ -309,15 +305,27 @@ update() {
     else
         __dirty=0
     fi
-    if [ "$(df -P $(pwd) | awk '/[0-9]%/{print $(NF-2)}')" -lt 1024 ]; then
+
+    __free_space=$(df -P "$(pwd)" | awk '/[0-9]%/{print $(NF-2)}')
+
+    re='^[0-9]+$'
+    if ! [[ "${__free_space}" =~ $re ]] ; then
+        echo "Unable to determine free disk space. This is likely a bug."
+        echo "df reports $(df -P "$(pwd)") and __free_space is ${__free_space}"
+    elif [ "$(df -P "$(pwd)" | awk '/[0-9]%/{print $(NF-2)}')" -lt 1024 ]; then
         echo "You have less than 1 MiB of space left on $(pwd)."
         echo "Aborting, as an update is not safe."
         exit 1
     fi
 
-    __docker_dir=$(docker system info --format '{{.DockerRootDir}}')
+    __docker_dir=$(dodocker system info --format '{{.DockerRootDir}}')
+    __free_space=$(df -P "${__docker_dir}" | awk '/[0-9]%/{print $(NF-2)}')
 
-    if [ "$(df -P ${__docker_dir} | awk '/[0-9]%/{print $(NF-2)}')" -lt 1048576 ]; then
+    re='^[0-9]+$'
+    if ! [[ "${__free_space}" =~ $re ]] ; then
+        echo "Unable to determine free disk space. This is likely a bug."
+        echo "df reports $(df -P "${__docker_dir}") and __free_space is ${__free_space}"
+    elif [ "${__free_space}" -lt 1048576 ]; then
         echo "You have less than 1 GiB of space left on ${__docker_dir}."
         echo "Aborting, as an update is not safe."
         exit 1
@@ -334,6 +342,7 @@ update() {
         ${__as_owner} git update-index --assume-unchanged ext-network.yml
         ${__as_owner} git config pull.rebase false
         ${__as_owner} git pull
+        export GITEXITCODE=$?
         # BASH_SOURCE so newer code gets to do the update. Use an ENV var
         # to avoid infinite loop
         export ETHDSECUNDO=1
@@ -344,7 +353,7 @@ update() {
     __targetcli=""
     while :
     do
-        if [ -z ${1+x} ]; then
+        if [ -z "${1+x}" ]; then
             break
         fi
         case "$1" in
@@ -373,9 +382,6 @@ update() {
         esac
     done
 
-# docker-ce 23.0.x has this as a dependency
-    check_for_apparmor
-
 # envmigrate used to be called w/ arguments and checks for that
 # shellcheck disable=SC2119
     envmigrate
@@ -398,21 +404,31 @@ update() {
     exec 2>&4
 
     echo
-    if ! cmp -s "${ENV_FILE}" "${ENV_FILE}".bak; then
+    if ! cmp -s "${ENV_FILE}" "${ENV_FILE}".source; then
+        cp "${ENV_FILE}".source "${ENV_FILE}".bak
+        rm "${ENV_FILE}".source
+        echo "Your ${ENV_FILE} configuration settings have been migrated to a fresh copy. You can \
+find the original contents in ${ENV_FILE}.bak."
+        if [ $__keeptargets = "0" ]; then
+            echo "NB: If you made changes to the source or binary build targets, these have been \
+reset to defaults."
+        fi
+        echo
         echo "List of changes made to ${ENV_FILE} during migration - current on left, original on right:"
         echo
         diff -y --suppress-common-lines "${ENV_FILE}" "${ENV_FILE}".bak
-	echo
         if [ "$__pre_merge" -eq 1 ]; then
+            echo
             echo "You appear to be coming from a pre-merge setup."
             echo "A copy of your original settings is in .env.premerge"
             echo
             echo "Pay special attention to EL_NODE, as failover is no longer supported."
-	    echo
-	    echo "Decide whether to use mev-boost. Please see MEV_BOOST in .env for details."
+            echo
+            echo "Decide whether to use mev-boost. Please see MEV_BOOST in .env for details."
         fi
     else
-        echo "No changes made to ${ENV_FILE} during migration"
+        echo "No changes made to ${ENV_FILE} during update"
+        rm "${ENV_FILE}".source
     fi
     if [ "$__el_infura" -eq 1 ]; then
         echo
@@ -428,14 +444,17 @@ update() {
         echo "Please take a look and adjust manually."
     fi
     echo
-    echo "Your ${ENV_FILE} configuration settings have been migrated to a fresh copy. You can \
-find the original contents in ${ENV_FILE}.bak."
-    if [ $__keeptargets = "0" ]; then
-      echo "NB: If you made changes to the source or binary build targets, these have been \
-reset to defaults."
+    if [ -z "${GITEXITCODE+x}" ] || [ "${GITEXITCODE}" -eq 0 ]; then
+        echo "An \"./ethd up\" command will start using the new images and configuration."
+    else
+        echo "WARNING"
+        echo
+        echo "Updating eth-docker failed during \"git pull\""
+        echo
+        echo "Please try \"git pull\" manually."
+        echo "Do not run \"./ethd up\" until git can update eth-docker."
+        echo "The current partial update risks startup failure."
     fi
-    echo
-    echo "An ./ethd up command will start using the new images and configuration."
     if [[ "$__distro" = "ubuntu" ]]; then
       __major_version=$(lsb_release -r | cut -d: -f2 | sed s/'^\t'// | cut -d. -f1)
       if [ "${__major_version}" -lt 20 ]; then
@@ -446,6 +465,7 @@ reset to defaults."
     fi
 
     unset ETHDSECUNDO
+    unset GITEXITCODE
     if [[ "${ETHDSWITCHED-}" -eq 1 ]]; then
         unset ETHDSWITCHED
         echo
@@ -469,7 +489,7 @@ reset to defaults."
         echo
         echo "WARNING"
         echo
-        echo "You have uncommitted local changes to eth-docker, which keeps updates from coming in."
+        echo "You have uncommitted local changes to eth-docker, which may interfere with updates."
         echo "Please undo these changes or \"git commit\" them."
         echo "These are the files with local changes:"
         echo
@@ -506,14 +526,14 @@ envmigrate() {
         return
     fi
 
-    ALL_VARS=( COMPOSE_FILE FEE_RECIPIENT EL_NODE GRAFFITI NETWORK MEV_BOOST MEV_RELAYS MEV_MIN_BID MEV_NODE \
-            CL_MAX_PEER_COUNT CL_MIN_PEER_COUNT EL_MAX_PEER_COUNT EL_MIN_PEER_COUNT DOMAIN ACME_EMAIL \
+    ALL_VARS=( COMPOSE_FILE FEE_RECIPIENT EL_NODE GRAFFITI DEFAULT_GRAFFITI NETWORK MEV_BOOST MEV_RELAYS MEV_MIN_BID MEV_NODE \
+            CL_MAX_PEER_COUNT CL_MIN_PEER_COUNT EL_MAX_PEER_COUNT EL_MIN_PEER_COUNT DOMAIN ACME_EMAIL AUTOPRUNE_NM \
             CF_EMAIL CF_API_TOKEN AWS_PROFILE AWS_HOSTED_ZONE_ID GRAFANA_HOST DISTRIBUTED BESU_HEAP TEKU_HEAP \
             PROM_HOST HOST_IP PRYSM_HOST EE_HOST EL_HOST EL_LB EL_WS_HOST EL_WS_LB CL_HOST CL_LB DDNS_SUBDOMAIN \
             DDNS_PROXY RAPID_SYNC_URL CL_NODE BEACON_STATS_API BEACON_STATS_MACHINE EL_P2P_PORT CL_P2P_PORT \
             PRYSM_PORT DOPPELGANGER PRYSM_UDP_PORT GRAFANA_PORT KEY_API_PORT TRAEFIK_WEB_PORT TRAEFIK_WEB_HTTP_PORT \
             CL_REST_PORT EL_RPC_PORT EL_WS_PORT EE_PORT ERIGON_TORRENT_PORT LOG_LEVEL JWT_SECRET EL_EXTRAS CL_EXTRAS \
-            VC_EXTRAS ARCHIVE_NODE SSV_P2P_PORT SSV_P2P_PORT_UDP ERIGON_P2P_PORT_2 ERIGON_P2P_PORT_3 )
+            VC_EXTRAS ARCHIVE_NODE SSV_P2P_PORT SSV_P2P_PORT_UDP ERIGON_P2P_PORT_2 ERIGON_P2P_PORT_3 COMPOSEV1_NAG )
     TARGET_VARS=( NIM_SRC_BUILD_TARGET NIM_DOCKER_TAG NIM_DOCKER_VC_TAG NIM_DOCKERFILE TEKU_SRC_BUILD_TARGET TEKU_DOCKER_TAG \
                 TEKU_DOCKERFILE LH_SRC_BUILD_TARGET LH_DOCKER_TAG LH_DOCKERFILE PRYSM_SRC_BUILD_TARGET \
                 PRYSM_DOCKER_TAG PRYSM_DOCKER_VC_TAG PRYSM_DOCKERFILE ERIGON_SRC_BUILD_TARGET ERIGON_DOCKER_TAG \
@@ -532,13 +552,11 @@ envmigrate() {
       if [ -f ./"${ENV_FILE}".bak ]; then
           rm "${ENV_FILE}".bak
       fi
-      sudo -u "${OWNER}" cp "${ENV_FILE}" "${ENV_FILE}".bak
+      sudo -u "${OWNER}" cp "${ENV_FILE}" "${ENV_FILE}".source
       sudo -u "${OWNER}" cp default.env "${ENV_FILE}"
-      sudo -u "${OWNER}" cp "${ENV_FILE}".bak .env.source
     else
-      cp "${ENV_FILE}" "${ENV_FILE}".bak
+      cp "${ENV_FILE}" "${ENV_FILE}".source
       cp default.env "${ENV_FILE}"
-      cp "${ENV_FILE}".bak .env.source
     fi
     # Detect pre-merge
     if grep -q "FALLBACK_NODE1" ".env.source"; then
@@ -610,7 +628,6 @@ envmigrate() {
     var="DISTRIBUTED"
     value=$(sed -n -e "s/^${var}=\(.*\)/\1/p" ".env" || true)
     if [[ "${value}" = "true" || "${__switched_branch-}" -eq 1 ]]; then
-        rm .env.source
         rm .env.original
         return
     fi
@@ -649,7 +666,6 @@ envmigrate() {
        set_value_in_env
        __el_adjusted=1
     fi
-    rm .env.source
     rm .env.original
 }
 
@@ -663,14 +679,14 @@ migrate_compose_file() {
     __new_grafana=0
     __grafana_regex=".+-grafana\.yml"
     __switched_branch=0
-    __old_ifs="$IFS"
     IFS=":"
     set -o noglob
 # Globbing is off
 # shellcheck disable=SC2206
     __ymlarray=($value) # split+glob with glob disabled, and split using : as delimiter
     set +o noglob
-    IFS="$__old_ifs"
+    # Unset restores default
+    unset IFS
 
     value=""
     for n in "${!__ymlarray[@]}"; do
@@ -770,24 +786,24 @@ resync-execution() {
 }
 
 resync-consensus() {
-    # Check for EL client
+    # Check for CL client
     var="COMPOSE_FILE"
     value=$(sed -n -e "s/^${var}=\(.*\)/\1/p" ".env" || true)
 
     case "${value}" in
         *lighthouse.yml* ) __cl_volume='lhbeacon-data'; __cl_client="lighthouse";;
         *lighthouse-cl-only.yml* ) __cl_volume='lhconsensus-data'; __cl_client="lighthouse";;
-        *teku.yml* ) __cl_volume=''; __cl_client="teku"; echo "This script does not yet know how to resync Teku without also deleting keys"; echo "Please delete the DB manually from sudo bash"; exit 0;;
+        *teku.yml* ) __cl_volume='wipe-db'; __cl_client="teku";;
         *teku-cl-only.yml* ) __cl_volume='tekuconsensus-data'; __cl_client="teku";;
-        *nimbus.yml* ) __cl_volume=''; __cl_client="nimbus"; echo "This script does not yet know how to resync Nimbus without also deleting keys"; echo "Please delete the DB manually from sudo bash"; exit 0;;
+        *nimbus.yml* ) __cl_volume='wipe-db'; __cl_client="nimbus";;
         *nimbus-cl-only.yml* ) __cl_volume='nimbusconsensus-data'; __cl_client="nimbus";;
-        *lodestar.yml* | *lodestar-cl-only.yml* ) __cl_volume='lsconsensus-data'; __el_client="lodestar";;
-        *prysm.yml* ) __cl_volume='prysmbeacon-data'; __el_client="prysm";;
-        *prysm-cl-only.yml* ) __cl_volume='prysmconsensus-data'; __el_client="prysm";;
+        *lodestar.yml* | *lodestar-cl-only.yml* ) __cl_volume='lsconsensus-data'; __cl_client="lodestar";;
+        *prysm.yml* ) __cl_volume='prysmbeacon-data'; __cl_client="prysm";;
+        *prysm-cl-only.yml* ) __cl_volume='prysmconsensus-data'; __cl_client="prysm";;
         * ) echo "You do not appear to be running a consensus layer client. Nothing to do."; return;;
     esac
 
-    if ! dodocker volume ls -q | grep -q "$(basename "$(realpath .)")[_-]${__cl_volume}"; then
+    if [ ! "${__cl_volume}" = "wipe-db" ] && ! dodocker volume ls -q | grep -q "$(basename "$(realpath .)")[_-]${__cl_volume}"; then
         echo "Did not find docker volume for ${__cl_client}. Nothing to do."
         return
     fi
@@ -808,7 +824,11 @@ resync-consensus() {
 
     echo "Stopping ${__cl_client} container"
     docompose stop consensus && docompose rm -f consensus
-    dodocker volume rm "$(dodocker volume ls -q -f "name=${__cl_volume}")"
+    if [ "${__cl_volume}" = "wipe-db" ]; then
+      docompose run --rm wipe-db
+    else
+      dodocker volume rm "$(dodocker volume ls -q -f "name=${__cl_volume}")"
+    fi
     echo ""
     echo "${__cl_client} stopped and database deleted."
     echo ""
@@ -856,7 +876,7 @@ prune-geth() {
     __non_interactive=0
     while :
     do
-        if [ -z ${1+x} ]; then
+        if [ -z "${1+x}" ]; then
             break
         fi
         case "$1" in
@@ -889,9 +909,17 @@ prune-geth() {
         return
     fi
 
-    __docker_dir=$(docker system info --format '{{.DockerRootDir}}')
+    __docker_dir=$(dodocker system info --format '{{.DockerRootDir}}')
+    __free_space=$(df -P "${__docker_dir}" | awk '/[0-9]%/{print $(NF-2)}')
 
-    if [ "$(df -P ${__docker_dir} | awk '/[0-9]%/{print $(NF-2)}')" -lt 41943040 ]; then
+    re='^[0-9]+$'
+    if ! [[ "${__free_space}" =~ $re ]] ; then
+        echo "Unable to determine free disk space. This is likely a bug."
+        echo "df reports $(df -P "${__docker_dir}") and __free_space is ${__free_space}"
+        return
+    fi
+
+    if [ "${__free_space}" -lt 41943040 ]; then
         echo "You do not have enough free disk space. Make sure this reads at least 40G free (Avail):"
         df -h "${__docker_dir}"
         echo ""
@@ -971,7 +999,7 @@ prune-nethermind() {
     __non_interactive=0
     while :
     do
-        if [ -z ${1+x} ]; then
+        if [ -z "${1+x}" ]; then
             break
         fi
         case "$1" in
@@ -1004,10 +1032,18 @@ prune-nethermind() {
         return
     fi
 
-    __docker_dir=$(docker system info --format '{{.DockerRootDir}}')
+    __docker_dir=$(dodocker system info --format '{{.DockerRootDir}}')
+    __free_space=$(df -P "${__docker_dir}" | awk '/[0-9]%/{print $(NF-2)}')
 
-    if [ "$(df -P ${__docker_dir} | awk '/[0-9]%/{print $(NF-2)}')" -lt 209715200 ]; then
-        echo "You do not have enough free disk space. Make sure this reads at least 200G free (Avail):"
+    re='^[0-9]+$'
+    if ! [[ "${__free_space}" =~ $re ]] ; then
+        echo "Unable to determine free disk space. This is likely a bug."
+        echo "df reports $(df -P "${__docker_dir}") and __free_space is ${__free_space}"
+        return
+    fi
+
+    if [ "${__free_space}" -lt 262144000 ]; then
+        echo "You do not have enough free disk space. Make sure this reads at least 250G free (Avail):"
         df -h "${__docker_dir}"
         echo ""
         echo "Aborting."
@@ -1040,8 +1076,14 @@ prune-nethermind() {
         exit 1
     fi
 
+    var="AUTOPRUNE_NM"
+    auto_prune=$(sed -n -e "s/^${var}=\(.*\)/\1/p" ".env" || true)
+
     if [ $__non_interactive = 0 ]; then
       while true; do
+          if [ ! "${auto_prune}" = true ]; then
+              echo "Nethermind should auto-prune below 350 GiB free. Check logs with \"./ethd logs -f --tail 50 execution\" to see whether it is."
+          fi
           read -rp "WARNING - this will prune Nethermind's database in the background. Do you wish to continue? (No/Yes) " yn
           case $yn in
               [Yy][Ee][Ss] ) break;;
@@ -1096,7 +1138,7 @@ prep-keyimport() {
 
     while :
     do
-        if [ -z ${1+x} ]; then
+        if [ -z "${1+x}" ]; then
             break
         fi
         case "$1" in
@@ -1116,6 +1158,7 @@ prep-keyimport() {
                 fi
                 IFS=$'\n'
                 files=$(find "$2" -maxdepth 1 -name '*.json')
+                # Unset restores default
                 unset IFS
                 if [ -z "$files" ]; then
                     echo "No .json files found in $2, aborting"
@@ -1123,6 +1166,7 @@ prep-keyimport() {
                 fi
                 IFS=$'\n'
                 files=$(find ./.eth/validator_keys -maxdepth 1 -name '*.json')
+                # Unset restores default
                 unset IFS
                 if [ -n "$files" ]; then
                     mkdir -p ./.eth/validator_keys/keybackup
@@ -1134,8 +1178,8 @@ prep-keyimport() {
                 shift 2
                 ;;
             --non-interactive)
-                if [ -z ${KEYSTORE_PASSWORD+x} ]; then
-                    echo "KEYSTORE_PASSWORD not set, aborting"
+                if [ -z "${KEYSTORE_PASSWORD+x}" ]; then
+                    echo "KEYSTORE_PASSWORD not set or empty, aborting"
                     exit 1
                 fi
                 __non_interactive=1
@@ -1149,7 +1193,79 @@ prep-keyimport() {
     done
 }
 
+__i_haz_ethdo() {
+    var="COMPOSE_FILE"
+    value=$(sed -n -e "s/^${var}=\(.*\)/\1/p" ".env" || true)
+# Literal match intended
+# shellcheck disable=SC2076
+    if [[ ! "${value}" =~ "ethdo.yml" ]]; then
+        echo "Please edit the .env file and make sure \":ethdo.yml\" is added to the \"COMPOSE_FILE\" line"
+        echo "For example, \"nano .env\" will open the nano text editor with the \".env\" file loaded."
+        echo "Without it, this step cannot be run"
+        echo
+        read -rp "Do you want me to make this change for you? (n/y)" yn
+        case $yn in
+            [Yy] );;
+            * ) exit 1;;
+        esac
+        COMPOSE_FILE="${value}:ethdo.yml"
+        set_value_in_env
+        echo "Your COMPOSE_FILE now reads ${COMPOSE_FILE}"
+    fi
+}
+
+
+__keys_usage() {
+    echo "Call keymanager with an ACTION, one of:"
+    echo "  list"
+    echo "     Lists the public keys of all validators currently loaded into your validator client"
+    echo "  import"
+    echo "      Import all keystore*.json in .eth/validator_keys while loading slashing protection data"
+    echo "      in slashing_protection*.json files that match the public key(s) of the imported validator(s)"
+    echo "  delete 0xPUBKEY | all"
+    echo "      Deletes the validator with public key 0xPUBKEY from the validator client, and exports its"
+    echo "      slashing protection database. \"all\" deletes all detected validators instead"
+    echo
+    echo "  get-recipient 0xPUBKEY"
+    echo "      List fee recipient set for the validator with public key 0xPUBKEY"
+    echo "      Validators will use FEE_RECIPIENT in .env by default, if not set individually"
+    echo "  set-recipient 0xPUBKEY 0xADDRESS"
+    echo "      Set individual fee recipient for the validator with public key 0xPUBKEY"
+    echo "  delete-recipient 0xPUBKEY"
+    echo "      Delete individual fee recipient for the validator with public key 0xPUBKEY"
+    echo
+    echo "  get-gas 0xPUBKEY"
+    echo "      List execution gas limit set for the validator with public key 0xPUBKEY"
+    echo "      Validators will use the client's default, if not set individually"
+    echo "  set-gas 0xPUBKEY amount"
+    echo "      Set individual execution gas limit for the validator with public key 0xPUBKEY"
+    echo "  delete-gas 0xPUBKEY"
+    echo "      Delete individual execution gas limit for the validator with public key 0xPUBKEY"
+    echo
+    echo "  get-api-token"
+    echo "      Print the token for the keymanager API running on port ${KEY_API_PORT:-7500}."
+    echo "      This is also the token for the Prysm Web UI"
+    echo
+    echo "  create-prysm-wallet"
+    echo "      Create a new Prysm wallet to store keys in"
+    echo "  get-prysm-wallet"
+    echo "      Print Prysm's wallet password"
+    echo
+    echo "  prepare-address-change"
+    echo "      Create an offline-preparation.json with ethdo"
+    echo "  send-address-change"
+    echo "      Send a change-operations.json with ethdo, setting the withdrawal address"
+    echo
+    echo "  sign-exit from-keystore [--offline]"
+    echo "      Create pre-signed exit messages with ethdo, from keystore files in ./.eth/validator_keys"
+}
+
 keys() {
+    if [[ "$#" -eq 0 || "$1" == "help" || "$1" == "-h" || "$1" == "--help" ]]; then
+        __keys_usage
+        return
+    fi
+
     __owner_uid=$(id -u "${OWNER}")
     if [ "${1:-}" = "import" ]; then
         shift
@@ -1165,47 +1281,162 @@ keys() {
         docompose rm --force validator
         up
     elif [ "${1:-}" = "prepare-address-change" ]; then
-        var="COMPOSE_FILE"
-        value=$(sed -n -e "s/^${var}=\(.*\)/\1/p" ".env" || true)
-        if [[ ! "${value}" =~ "ethdo.yml" ]]; then
-            echo "Please make sure ethdo.yml is part of COMPOSE_FILE in .env"
-            echo "Without it, this step cannot be run"
-            exit 1
+        __i_haz_ethdo
+        up
+        echo "Generating offline prep file"
+        docompose run --rm ethdo validator credentials set --prepare-offline
+        exitstatus=$?
+        if [ "${exitstatus}" -ne 0 ]; then
+            echo "Running ethdo failed, unfortunately."
+            echo "Please try again after fixing root cause. Aborting."
+            return 1
         fi
-        docompose run --rm ethdo validator credentials set --prepare-offline --timeout 2m
         echo
         echo "Downloading ethdo"
         REPO="wealdtech/ethdo"; \
-        curl -s https://api.github.com/repos/${REPO}/releases/latest | grep "browser_download_url.*linux-amd64.tar.gz" \
+        wget -q -O- https://api.github.com/repos/${REPO}/releases/latest | grep "browser_download_url.*linux-amd64.tar.gz" \
         | head -1 \
         | cut -d : -f 2,3 \
         | tr -d \" \
-        | wget -qi - -O- \
+        | wget -qi- -O- \
         | tar zxf - -C ./.eth/ethdo/ \
         || echo "-> Could not download the latest version of '${REPO}' for amd64."
         mkdir -p ./.eth/ethdo/arm64
-        curl -s https://api.github.com/repos/${REPO}/releases/latest | grep "browser_download_url.*linux-arm64.tar.gz" \
+        wget -q -O- https://api.github.com/repos/${REPO}/releases/latest | grep "browser_download_url.*linux-arm64.tar.gz" \
         | head -1 \
         | cut -d : -f 2,3 \
         | tr -d \" \
-        | wget -qi - -O- \
+        | wget -qi- -O- \
         | tar zxf - -C ./.eth/ethdo/arm64 \
         || echo "-> Could not download the latest version of '${REPO}' for arm64."
         mv ./.eth/ethdo/arm64/ethdo ./.eth/ethdo/ethdo-arm64
         rm -rf ./.eth/ethdo/arm64
         echo
         echo "Copy the contents of ./.eth/ethdo to a USB drive, and prepare a Linux Live USB to safely enter your mnemonic."
-        echo "Please see ./.eth/ethdo/README.md for details"
+        echo "Please see https://eth-docker.net/Support/ChangingWithdrawalCredentials for details"
     elif [ "${1:-}" = "send-address-change" ]; then
-        var="COMPOSE_FILE"
-        value=$(sed -n -e "s/^${var}=\(.*\)/\1/p" ".env" || true)
-        if [[ ! "${value}" =~ "ethdo.yml" ]]; then
-            echo "Please make sure ethdo.yml is part of COMPOSE_FILE in .env"
-            echo "Without it, this step cannot be run"
-            exit 1
+        __i_haz_ethdo
+        # We need things up so we can query
+        up
+        docompose run --rm ethdo validator credentials set
+    elif [ "${1:-}" = "sign-exit" ] && [ "${2:-}" = "from-keystore" ]; then
+        __i_haz_ethdo
+        # We need things up so we can query
+        up
+
+        __offline=""
+        if echo "$@" | grep -q '.*--offline.*' 2>/dev/null ; then
+          __offline="--offline"
         fi
-        docompose run --rm ethdo validator credentials set --timeout 2m
+
+        __non_interactive=0
+        if echo "$@" | grep -q '.*--non-interactive.*' 2>/dev/null ; then
+          __non_interactive=1
+        fi
+
+        if [ ${__non_interactive} = 1 ]; then
+            __password="${KEYSTORE_PASSWORD}"
+            __justone=1
+        else
+            __num_files=$(find .eth/validator_keys -maxdepth 1 -type f -name 'keystore*.json' | wc -l)
+            if [ "$__num_files" -eq 0 ]; then
+                echo "No keystore*.json files found in .eth/validator_keys/"
+                echo "Nothing to do"
+                exit 0
+            fi
+
+            if [ "$__num_files" -gt 1 ]; then
+                while true; do
+                    read -rp "Do all validator keys have the same password? (y/n) " yn
+                    case $yn in
+                        [Yy]* ) __justone=1; break;;
+                        [Nn]* ) __justone=0; break;;
+                        * ) echo "Please answer yes or no.";;
+                    esac
+                done
+            else
+                __justone=1
+            fi
+            if [ "${__justone}" -eq 1 ]; then
+                while true; do
+                    read -srp "Please enter the password for your validator key(s): " __password
+                    echo
+                    read -srp "Please re-enter the password: " __password2
+                    echo
+                    if [ "${__password}" == "${__password2}" ]; then
+                        break
+                    else
+                        echo "The two entered passwords do not match, please try again."
+                        echo
+                    fi
+                done
+                echo
+            fi
+        fi
+
+        docompose run --rm ethdo --base-dir /app/wallet wallet delete --wallet=exits >/dev/null 2>&1
+        docompose run --rm ethdo --base-dir /app/wallet wallet create --wallet=exits
+
+        i=1
+        created=0
+        failed=0
+        mkdir -p .eth/exit_messages
+        for __keyfile in .eth/validator_keys/keystore-*.json; do
+            [ -f "${__keyfile}" ] || continue # Should always evaluate true - just in case
+            if [ "${__justone}" -eq 0 ]; then
+                while true; do
+                    read -srp "Please enter the password for your validator key stored in ${__keyfile}: " __password
+                    echo
+                    read -srp "Please re-enter the password: " __password2
+                    echo
+                    if [ "${__password}" == "${__password2}" ]; then
+                        break
+                    else
+                        echo "The two entered passwords do not match, please try again."
+                        echo
+                    fi
+                    echo
+                done
+            fi
+
+            __pubkey=$(docompose run --rm ethdo account import --base-dir /app/wallet --account exits/"${i}" --keystore "/app/.eth/validator_keys/$(basename "${__keyfile}")" --keystore-passphrase "${__password}" --passphrase "${__password}" --allow-weak-passphrases --verbose)
+            exitstatus=$?
+            if [ "${exitstatus}" -ne 0 ]; then
+                echo "Importing ${__keyfile} failed"
+                echo "Was the supplied password correct?"
+                (( i++ ))
+                continue
+            fi
+            __json=$(docompose run --rm ethdo validator exit --base-dir /app/wallet --validator exits/"${i}" --json --timeout 2m --passphrase "${__password}" ${__offline})
+            exitstatus=$?
+            if [ "${exitstatus}" -eq 0 ]; then
+              echo "${__json}" >".eth/exit_messages/${__pubkey}-exit.json"
+              exitstatus=$?
+              if [ "${exitstatus}" -eq 0 ]; then
+                echo "Creating an exit message for validator ${__pubkey} into file ./.eth/exit_messages/${__pubkey}-exit.json succeeded"
+                (( created++ ))
+              else
+                echo "Error writing exit json to file ./.eth/exit_messages/${__pubkey}-exit.json"
+                (( failed++ ))
+              fi
+            else
+                echo "Creating an exit message for validator ${__pubkey} from file ${__keyfile} failed"
+                (( failed++ ))
+            fi
+            (( i++ ))
+        done
+        docompose run --rm ethdo --base-dir /app/wallet wallet delete --wallet=exits
+        echo
+        echo "Created pre-signed exit messages for ${created} validators"
+        if [ "${created}" -gt 0 ]; then
+          echo "You can find them in ./.eth/exit_messages"
+        fi
+        if [ "${failed}" -gt 0 ]; then
+          echo "Failed for ${failed} validators"
+        fi
     else
+        # We need things up so we can query
+        up
         docompose run --rm -e OWNER_UID="${__owner_uid}" validator-keys "$@"
     fi
 }
@@ -1531,7 +1762,7 @@ query_execution_client() {
 }
 
 query_grafana() {
-    if (whiptail --title "Select Option" --yesno "Do you want to use Grafana dashboards?" 10 60) then
+    if (whiptail --title "Grafana" --yesno "Do you want to use Grafana dashboards?" 10 60) then
         if [[ "$OSTYPE" == "darwin"* ]]; then
         # macOS doesn't do well with / bind mount - leave node-exporter, cadvisor and loki/promtail off by default
             GRAFANA_CLIENT="grafana-rootless.yml:grafana-shared.yml"
@@ -1591,11 +1822,11 @@ query_checkpoint_beacon() {
         esac
     fi
 
-    RAPID_SYNC_URL=$(whiptail --title "Configure checkpoint consensus client" --inputbox "What is the URL for your checkpoint consensus client? (right-click to paste)" 10 60 "${RAPID_SYNC_URL}" 3>&1 1>&2 2>&3)
+    RAPID_SYNC_URL=$(whiptail --title "Configure checkpoint URL" --inputbox "What is the URL for your checkpoint provider? (right-click to paste)" 10 60 "${RAPID_SYNC_URL}" 3>&1 1>&2 2>&3)
 
     exitstatus=$?
     if [ $exitstatus -eq 0 ]; then
-        echo "Your checkpoint consensus client is:" "${RAPID_SYNC_URL}"
+        echo "Your checkpoint URL is:" "${RAPID_SYNC_URL}"
     else
         echo "You chose Cancel."
         exit 1
@@ -1618,7 +1849,7 @@ query_graffiti() {
 }
 
 query_rapid_sync() {
-    if (whiptail --title "Select Option" --yesno "Do you want to use CL rapid sync with remote checkpoint?" 10 60) then
+    if (whiptail --title "Checkpoint Sync" --yesno "Do you want to use CL rapid sync with remote checkpoint?" 10 60) then
         query_checkpoint_beacon
     fi
 }
@@ -1628,7 +1859,7 @@ query_coinbase() {
     FEE_RECIPIENT=$(sed -n -e "s/^${var}=\(.*\)/\1/p" ".env" || true)
 
     while true; do
-        FEE_RECIPIENT=$(whiptail --title "Configure Rewards Address" --inputbox "What is the address you want transaction rewards to be sent to by default? (right-click to paste, CANNOT be an ENS)" 10 60 "${FEE_RECIPIENT}" 3>&1 1>&2 2>&3)
+        FEE_RECIPIENT=$(whiptail --title "Configure rewards address" --inputbox "What is the address you want transaction rewards to be sent to by default? (right-click to paste, CANNOT be an ENS)" 10 60 "${FEE_RECIPIENT}" 3>&1 1>&2 2>&3)
 
         exitstatus=$?
         if [ $exitstatus -eq 0 ]; then
@@ -1667,7 +1898,7 @@ query_mev() {
     fi
     var="MEV_BOOST"
     value=$(sed -n -e "s/^${var}=\(.*\)/\1/p" ".env" || true)
-    if (whiptail --title "Select Option" --yesno "Do you want to use MEV Boost?" 10 60) then
+    if (whiptail --title "MEV Boost" --yesno "Do you want to use MEV Boost?" 10 60) then
         MEV_BOOST="true"
         if [ "${value}" = "true" ]; then
             var="MEV_RELAYS"
@@ -1805,13 +2036,13 @@ config() {
     fi
 
     COMPOSE_FILE="${CONSENSUS_CLIENT}"
-    if [ "${EXECUTION_CLIENT+x}" ]; then
+    if [ -n "${EXECUTION_CLIENT+x}" ]; then
         COMPOSE_FILE="${COMPOSE_FILE}:${EXECUTION_CLIENT}"
     fi
     if [ "${__deployment}" = "blox" ]; then
         COMPOSE_FILE="${COMPOSE_FILE}:blox-ssv2.yml"
     fi
-    if [ "${GRAFANA_CLIENT+x}" ]; then
+    if [ -n "${GRAFANA_CLIENT+x}" ]; then
         COMPOSE_FILE="${COMPOSE_FILE}:${GRAFANA_CLIENT}"
     fi
     if [ "${MEV_BOOST}" = "true" ]; then
@@ -1848,6 +2079,8 @@ config() {
     var=MEV_RELAYS
     set_value_in_env
     if [[ "${NETWORK}" = "gnosis" ]] && [[ "${CONSENSUS_CLIENT}" =~ "nimbus" ]] ; then
+# We are using the variable
+# shellcheck disable=SC2034
         NIM_DOCKERFILE=Dockerfile.sourcegnosis
         var=NIM_DOCKERFILE
         set_value_in_env
@@ -2069,3 +2302,14 @@ if [ "$__result" -eq 127 ]; then
 fi
 
 check_disk_space
+
+var="COMPOSEV1_NAG"
+value=$(sed -n -e "s/^${var}=\(.*\)/\1/p" ".env" || true)
+
+if [ "${value}" = true ] && [ "${__old_compose}" -eq 1 ]; then
+  echo
+  echo "You are using docker-compose ${__compose_version}, which is unsupported by Docker, Inc. from June 2023 on."
+  echo "A switch to docker-ce is recommended. This is unfortunately a manual step that eth-docker cannot do for you."
+  echo "Please see https://eth-docker.net/Usage/Prerequisites#switching-from-dockerio-to-docker-ce for instructions."
+  echo "You can turn this message off by adjusting COMPOSEV1_NAG in .env"
+fi

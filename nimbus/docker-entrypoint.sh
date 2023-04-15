@@ -60,6 +60,12 @@ else
   __prune="--history=prune"
 fi
 
+if [ "${DEFAULT_GRAFFITI}" = "true" ]; then
 # Word splitting is desired for the command line parameters
 # shellcheck disable=SC2086
-exec "$@" ${__mev_boost} ${__log_level} ${__doppel} ${__prune} ${CL_EXTRAS} ${VC_EXTRAS}
+  exec "$@" ${__mev_boost} ${__log_level} ${__doppel} ${__prune} ${CL_EXTRAS} ${VC_EXTRAS}
+else
+# Word splitting is desired for the command line parameters
+# shellcheck disable=SC2086
+  exec "$@" "--graffiti=${GRAFFITI}" ${__mev_boost} ${__log_level} ${__doppel} ${__prune} ${CL_EXTRAS} ${VC_EXTRAS}
+fi

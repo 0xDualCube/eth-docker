@@ -28,6 +28,8 @@ services:
       - JWT_SECRET=${JWT_SECRET}
       - MEV_BOOST=${MEV_BOOST}
       - MEV_NODE=${MEV_NODE}
+      - BEACON_STATS_API=${BEACON_STATS_API}
+      - BEACON_STATS_MACHINE=${BEACON_STATS_MACHINE}
       - CL_EXTRAS=${CL_EXTRAS:-}
       - ARCHIVE_NODE=${ARCHIVE_NODE:-}
     ports:
@@ -73,8 +75,12 @@ services:
     user: lsvalidator
     environment:
       - MEV_BOOST=${MEV_BOOST}
+      - BEACON_STATS_API=${BEACON_STATS_API}
+      - BEACON_STATS_MACHINE=${BEACON_STATS_MACHINE}
       - DOPPELGANGER=${DOPPELGANGER}
       - VC_EXTRAS=${VC_EXTRAS:-}
+      - GRAFFITI=${GRAFFITI:-}
+      - DEFAULT_GRAFFITI=${DEFAULT_GRAFFITI:-false}
     volumes:
       - lsvalidator-data:/var/lib/lodestar/validators
       - /etc/localtime:/etc/localtime:ro
@@ -102,8 +108,6 @@ services:
       - "8009"
       - --metrics.address
       - 0.0.0.0
-      - --graffiti
-      - ${GRAFFITI}
       - --logLevel
       - ${LOG_LEVEL}
       - --network
