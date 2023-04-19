@@ -45,7 +45,7 @@ services:
       - --http.vhosts=*
       - --http.corsdomain=*
       - --http.api
-      - web3,eth,net
+      - web3,eth,net,debug
       - --datadir
       - /var/lib/goethereum
       - --port
@@ -58,7 +58,7 @@ services:
       - --ws.port
       - ${EL_WS_PORT:-8546}
       - --ws.api
-      - web3,eth,net
+      - web3,eth,net,debug
       - --ws.origins=*
       - --${NETWORK}
       - --metrics
