@@ -30,7 +30,6 @@ services:
       - --entrypoints.websecure.address=:${TRAEFIK_WEB_PORT}
       - --metrics
       - --metrics.prometheus
-
     ports:
       - ${HOST_IP:-}${TRAEFIK_WEB_PORT}:${TRAEFIK_WEB_PORT}/tcp
       - ${HOST_IP:-}${TRAEFIK_WEB_HTTP_PORT}:${TRAEFIK_WEB_HTTP_PORT}/tcp
@@ -43,8 +42,10 @@ services:
       - /etc/localtime:/etc/localtime:ro
     <<: *logging
     depends_on:
-      - cf-ddns
-  cf-ddns:
+      - cf-ddns-v4
+      - cf-ddns-v6
+
+  cf-ddns-v4:
     image: oznu/cloudflare-ddns:latest
     restart: "unless-stopped"
     environment:
@@ -55,5 +56,19 @@ services:
     volumes:
       - /etc/localtime:/etc/localtime:ro
     <<: *logging
+
+  cf-ddns-v6:
+    image: oznu/cloudflare-ddns:latest
+    restart: "unless-stopped"
+    environment:
+      - API_KEY=${CF_API_TOKEN}
+      - ZONE=${DOMAIN}
+      - SUBDOMAIN=${DDNS_SUBDOMAIN}
+      - PROXIED=${DDNS_PROXY}
+      - RRTYPE=AAAA
+    volumes:
+      - /etc/localtime:/etc/localtime:ro
+    <<: *logging
+
 volumes:
   certs:
