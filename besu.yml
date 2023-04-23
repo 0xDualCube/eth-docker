@@ -45,7 +45,7 @@ services:
       - ${EL_P2P_PORT:-30303}
       - --rpc-http-enabled
       - --rpc-http-api
-      - "WEB3,ETH,NET,DEBUG"
+      - "WEB3,ETH,NET,DEBUG,TXPOOL"
       - --rpc-http-host
       - 0.0.0.0
       - --rpc-http-port
