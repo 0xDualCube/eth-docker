@@ -55,7 +55,7 @@ services:
       - --rpc-max-logs-range=65536
       - --rpc-ws-enabled
       - --rpc-ws-api
-      - "WEB3,ETH,NET,DEBUG"
+      - "WEB3,ETH,NET,DEBUG,TXPOOL"
       - --rpc-ws-host
       - 0.0.0.0
       - --rpc-ws-port
